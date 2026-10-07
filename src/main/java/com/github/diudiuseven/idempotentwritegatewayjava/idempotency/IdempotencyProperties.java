@@ -28,6 +28,9 @@ public class IdempotencyProperties {
     /** 内存中保留的最大键数量，超出则拒绝新键。 */
     private int maxEntries = 10_000;
 
+    /** 容量拒绝记录在运维视图中的保留时长，过期后不再可见并被清理。 */
+    private Duration rejectionTtl = Duration.ofMinutes(1);
+
     public Duration getEntryTtl() {
         return entryTtl;
     }
@@ -74,5 +77,13 @@ public class IdempotencyProperties {
 
     public void setMaxEntries(int maxEntries) {
         this.maxEntries = maxEntries;
+    }
+
+    public Duration getRejectionTtl() {
+        return rejectionTtl;
+    }
+
+    public void setRejectionTtl(Duration rejectionTtl) {
+        this.rejectionTtl = rejectionTtl;
     }
 }

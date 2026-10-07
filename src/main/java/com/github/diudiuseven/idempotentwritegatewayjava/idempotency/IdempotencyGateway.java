@@ -34,6 +34,7 @@ public class IdempotencyGateway implements AutoCloseable {
     private final FailurePolicy failurePolicy;
     private final Clock clock;
     private final ConcurrentHashMap<ScopedKey, KeyState> states = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<ScopedKey, RejectionRecord> rejections = new ConcurrentHashMap<>();
     private final Semaphore inFlightPermits;
     private final ScheduledExecutorService cleaner;
 
@@ -61,7 +62,14 @@ public class IdempotencyGateway implements AutoCloseable {
     @SuppressWarnings("unchecked")
     public <T> T execute(String caller, String key, Supplier<T> action) {
         ScopedKey scoped = new ScopedKey(caller, key);
-        Decision decision = decide(scoped);
+        Decision decision;
+        try {
+            decision = decide(scoped);
+        } catch (CapacityExceededException e) {
+            // 容量拒绝也留下可观测记录（独立存储，不影响该键后续正常处理）
+            recordRejection(scoped, e);
+            throw e;
+        }
         return switch (decision.role) {
             case LEADER -> runAsLeader(scoped, decision.state, action);
             case WAITER -> (T) awaitResult(scoped, decision.state);
@@ -72,14 +80,19 @@ public class IdempotencyGateway implements AutoCloseable {
 
     /** 查看指定键的当前状态。 */
     public Optional<KeyStateView> inspect(String caller, String key) {
-        KeyState state = states.get(new ScopedKey(caller, key));
-        if (state == null || isExpired(state)) {
-            return Optional.empty();
+        ScopedKey scoped = new ScopedKey(caller, key);
+        KeyState state = states.get(scoped);
+        if (state != null && !isExpired(state)) {
+            return Optional.of(toView(state));
         }
-        return Optional.of(toView(state));
+        RejectionRecord rejection = rejections.get(scoped);
+        if (rejection != null && !isExpired(rejection)) {
+            return Optional.of(toView(rejection));
+        }
+        return Optional.empty();
     }
 
-    /** 列出当前所有未过期键的状态。 */
+    /** 列出当前所有未过期键的状态（含容量拒绝记录）。 */
     public List<KeyStateView> list() {
         List<KeyStateView> views = new ArrayList<>();
         states.forEach((scoped, state) -> {
@@ -87,12 +100,20 @@ public class IdempotencyGateway implements AutoCloseable {
                 views.add(toView(state));
             }
         });
+        rejections.forEach((scoped, rejection) -> {
+            if (!isExpired(rejection) && !viewsContain(views, scoped)) {
+                views.add(toView(rejection));
+            }
+        });
         return views;
     }
 
     /** 主动清理指定键的状态，返回是否存在并被移除。 */
     public boolean evict(String caller, String key) {
-        return states.remove(new ScopedKey(caller, key)) != null;
+        ScopedKey scoped = new ScopedKey(caller, key);
+        boolean removed = states.remove(scoped) != null;
+        removed |= rejections.remove(scoped) != null;
+        return removed;
     }
 
     @Override
@@ -124,6 +145,25 @@ public class IdempotencyGateway implements AutoCloseable {
             this.scoped = scoped;
             this.createdAtMillis = nowMillis;
             this.expiresAtMillis = nowMillis + ttlMillis;
+        }
+    }
+
+    /**
+     * 容量拒绝的可观测记录。与键状态完全隔离存储：
+     * 不参与角色决策，不影响同键后续请求的正常处理；
+     * 按 {@code rejection-ttl} 过期并被清理，数量受 {@code max-entries} 约束，内存占用有界。
+     */
+    private static final class RejectionRecord {
+        final ScopedKey scoped;
+        final long createdAtMillis;
+        final long expiresAtMillis;
+        final String reason;
+
+        RejectionRecord(ScopedKey scoped, long nowMillis, long ttlMillis, String reason) {
+            this.scoped = scoped;
+            this.createdAtMillis = nowMillis;
+            this.expiresAtMillis = nowMillis + ttlMillis;
+            this.reason = reason;
         }
     }
 
@@ -217,12 +257,42 @@ public class IdempotencyGateway implements AutoCloseable {
     }
 
     private boolean isExpired(KeyState state) {
+        // 在途执行永不过期：合并状态只与执行是否结束有关，与执行耗时和结果有效期无关。
+        // 只有执行结束（COMPLETED/FAILED）且结果缓存到期后，条目才允许过期、被清理或淘汰。
+        if (state.status == KeyStatus.IN_FLIGHT) {
+            return false;
+        }
         return clock.millis() >= state.expiresAtMillis;
+    }
+
+    private boolean isExpired(RejectionRecord record) {
+        return clock.millis() >= record.expiresAtMillis;
+    }
+
+    private void recordRejection(ScopedKey scoped, CapacityExceededException cause) {
+        long now = clock.millis();
+        RejectionRecord record = new RejectionRecord(
+                scoped, now, properties.getRejectionTtl().toMillis(), String.valueOf(cause.getMessage()));
+        rejections.merge(scoped, record, (existing, fresh) -> isExpired(existing) ? fresh : existing);
+        // 拒绝记录数量同样受 max-entries 约束，避免高负载下无界堆积
+        if (rejections.mappingCount() > properties.getMaxEntries()) {
+            rejections.entrySet().removeIf(entry -> isExpired(entry.getValue()));
+        }
+    }
+
+    private static boolean viewsContain(List<KeyStateView> views, ScopedKey scoped) {
+        for (KeyStateView view : views) {
+            if (view.caller().equals(scoped.caller()) && view.key().equals(scoped.key())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void cleanupSafely() {
         try {
             states.entrySet().removeIf(entry -> isExpired(entry.getValue()));
+            rejections.entrySet().removeIf(entry -> isExpired(entry.getValue()));
         } catch (Throwable ignored) {
             // 清理任务不得因异常终止调度
         }
@@ -238,6 +308,18 @@ public class IdempotencyGateway implements AutoCloseable {
                 state.waiters.get(),
                 state.failure == null ? null : String.valueOf(state.failure.getMessage()),
                 state.retryableFailure);
+    }
+
+    private KeyStateView toView(RejectionRecord record) {
+        return new KeyStateView(
+                record.scoped.caller(),
+                record.scoped.key(),
+                KeyStatus.REJECTED,
+                Instant.ofEpochMilli(record.createdAtMillis),
+                Instant.ofEpochMilli(record.expiresAtMillis),
+                0,
+                record.reason,
+                false);
     }
 
     private static RuntimeException propagate(Throwable t) {

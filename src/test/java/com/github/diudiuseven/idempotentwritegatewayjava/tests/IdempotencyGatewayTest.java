@@ -299,6 +299,106 @@ class IdempotencyGatewayTest {
     }
 
     @Test
+    void inFlightExecutionMergesEvenWhenExecutionExceedsEntryTtl() throws Exception {
+        IdempotencyGateway gw = newGateway(p -> {
+            p.setEntryTtl(Duration.ofMinutes(1));
+            p.setWaitTimeout(Duration.ofSeconds(5));
+        });
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger executions = new AtomicInteger();
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        Future<String> leader = pool.submit(() -> gw.execute("caller-a", "slow", () -> {
+            executions.incrementAndGet();
+            entered.countDown();
+            await(release);
+            return "slow-result";
+        }));
+        await(entered);
+
+        // 执行耗时超过结果有效期：在途键不得过期、不得被后台清理移除
+        clock.advance(Duration.ofMinutes(10));
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5))
+                .until(() -> gw.inspect("caller-a", "slow")
+                        .map(v -> v.status() == KeyStatus.IN_FLIGHT).orElse(false));
+
+        // 后来请求无论多晚都并入同一次执行，不会再次触发下游
+        Future<String> waiter = pool.submit(() -> gw.execute("caller-a", "slow", () -> {
+            executions.incrementAndGet();
+            return "duplicate";
+        }));
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5))
+                .until(() -> gw.inspect("caller-a", "slow").map(KeyStateView::waiterCount).orElse(0) == 1);
+
+        release.countDown();
+        assertThat(leader.get(5, TimeUnit.SECONDS)).isEqualTo("slow-result");
+        assertThat(waiter.get(5, TimeUnit.SECONDS)).isEqualTo("slow-result");
+        assertThat(executions.get()).isEqualTo(1);
+        pool.shutdownNow();
+    }
+
+    @Test
+    void capacityRejectionIsObservableAndDoesNotAffectSubsequentRequests() throws Exception {
+        IdempotencyGateway gw = newGateway(p -> {
+            p.setMaxInFlight(1);
+            p.setRejectionTtl(Duration.ofMinutes(5));
+        });
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<String> first = pool.submit(() -> gw.execute("caller-a", "k1", () -> {
+            entered.countDown();
+            await(release);
+            return "done";
+        }));
+        await(entered);
+
+        // 容量拒绝：请求被拒绝，且拒绝记录可在运维视图中查询到，状态可区分
+        assertThatThrownBy(() -> gw.execute("caller-a", "k2", () -> "never"))
+                .isInstanceOf(CapacityExceededException.class);
+        assertThat(gw.inspect("caller-a", "k2")).get()
+                .extracting(KeyStateView::status).isEqualTo(KeyStatus.REJECTED);
+        assertThat(gw.inspect("caller-a", "k2")).get()
+                .extracting(KeyStateView::failureMessage).asString().contains("in-flight");
+        assertThat(gw.list()).anySatisfy(view -> {
+            assertThat(view.key()).isEqualTo("k2");
+            assertThat(view.status()).isEqualTo(KeyStatus.REJECTED);
+        });
+
+        // 拒绝记录不影响同键后续请求的正常处理
+        release.countDown();
+        assertThat(first.get(5, TimeUnit.SECONDS)).isEqualTo("done");
+        assertThat(gw.execute("caller-a", "k2", () -> "ok-now")).isEqualTo("ok-now");
+        // 同键已有正常状态后，运维视图展示正常状态而非陈旧的拒绝记录
+        assertThat(gw.inspect("caller-a", "k2")).get()
+                .extracting(KeyStateView::status).isEqualTo(KeyStatus.COMPLETED);
+        pool.shutdownNow();
+    }
+
+    @Test
+    void rejectionRecordExpiresAndIsCleanedUp() {
+        IdempotencyGateway gw = newGateway(p -> {
+            p.setMaxEntries(1);
+            p.setRejectionTtl(Duration.ofMinutes(1));
+        });
+        // 占满键容量：先执行一个键使其驻留
+        gw.execute("caller-a", "resident", () -> "v");
+        // 新键因 max-entries 超限被拒绝，拒绝记录可查询
+        assertThatThrownBy(() -> gw.execute("caller-a", "overflow", () -> "never"))
+                .isInstanceOf(CapacityExceededException.class);
+        assertThat(gw.inspect("caller-a", "overflow")).get()
+                .extracting(KeyStateView::status).isEqualTo(KeyStatus.REJECTED);
+
+        // 拒绝记录到期后不再可见，并被后台清理移除，不会长期堆积
+        clock.advance(Duration.ofMinutes(2));
+        assertThat(gw.inspect("caller-a", "overflow")).isEmpty();
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5))
+                .until(() -> gw.list().stream().noneMatch(v -> v.status() == KeyStatus.REJECTED));
+    }
+
+    @Test
     void evictRemovesKeyState() {
         IdempotencyGateway gw = newGateway(p -> {
         });
@@ -329,7 +429,7 @@ class IdempotencyGatewayTest {
     }
 
     private static final class MutableClock extends Clock {
-        private Instant instant = Instant.now();
+        private volatile Instant instant = Instant.now();
 
         void advance(Duration duration) {
             instant = instant.plus(duration);
