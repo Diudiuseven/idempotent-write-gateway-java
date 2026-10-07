@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -264,6 +265,167 @@ class IdempotencyGatewayTest {
         release.countDown();
         assertThat(leader.get(5, TimeUnit.SECONDS)).isEqualTo("done");
         assertThat(waiter.get(5, TimeUnit.SECONDS)).isEqualTo("done");
+        pool.shutdownNow();
+    }
+
+    @Test
+    void executionLongerThanTtlStillMergesAndTriggersDownstreamOnce() throws Exception {
+        // 结果有效期远短于执行耗时：在途期间合并语义必须与 TTL 完全无关
+        IdempotencyGateway gw = newGateway(p -> {
+            p.setEntryTtl(Duration.ofMillis(100));
+            p.setWaitTimeout(Duration.ofSeconds(5));
+        });
+        AtomicInteger executions = new AtomicInteger();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        Future<String> leader = pool.submit(() -> gw.execute("caller-a", "slow", () -> {
+            executions.incrementAndGet();
+            entered.countDown();
+            await(release);
+            return "slow-result";
+        }));
+        await(entered);
+
+        // 时钟推进到远超结果有效期，且让后台清理任务多跑几轮
+        clock.advance(Duration.ofMinutes(10));
+        Thread.sleep(200);
+
+        // 在途键既不可见为过期，也不得被清理移除
+        assertThat(gw.inspect("caller-a", "slow")).get()
+                .extracting(KeyStateView::status).isEqualTo(KeyStatus.IN_FLIGHT);
+
+        // 后来请求必须并入同一次执行（表现为等待方挂起），而不是成为新的执行者
+        Future<String> lateWaiter = pool.submit(() -> gw.execute("caller-a", "slow", () -> {
+            executions.incrementAndGet();
+            return "should-not-run";
+        }));
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5))
+                .until(() -> gw.inspect("caller-a", "slow").map(KeyStateView::waiterCount).orElse(0) == 1);
+
+        release.countDown();
+        assertThat(leader.get(5, TimeUnit.SECONDS)).isEqualTo("slow-result");
+        assertThat(lateWaiter.get(5, TimeUnit.SECONDS)).isEqualTo("slow-result");
+        assertThat(executions.get()).isEqualTo(1);
+
+        // 有效期从执行结束时起算：再推进超过一个 TTL 后才允许重新执行
+        clock.advance(Duration.ofMillis(101));
+        assertThat(gw.execute("caller-a", "slow", () -> "v" + executions.incrementAndGet()))
+                .isEqualTo("v2");
+        assertThat(executions.get()).isEqualTo(2);
+        pool.shutdownNow();
+    }
+
+    @Test
+    void capacityRejectionIsObservableWithDistinguishableStatusAndDoesNotBlockRetry() throws Exception {
+        IdempotencyGateway gw = newGateway(p -> p.setMaxInFlight(1));
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<String> first = pool.submit(() -> gw.execute("caller-a", "k1", () -> {
+            entered.countDown();
+            await(release);
+            return "done";
+        }));
+        await(entered);
+
+        // 新键因在途容量不足被拒绝
+        assertThatThrownBy(() -> gw.execute("caller-a", "rejected-key", () -> "never"))
+                .isInstanceOf(CapacityExceededException.class);
+
+        // 拒绝记录可查询且带可区分的 REJECTED 状态与拒绝原因
+        KeyStateView rejectedView = gw.inspect("caller-a", "rejected-key").orElseThrow();
+        assertThat(rejectedView.status()).isEqualTo(KeyStatus.REJECTED);
+        assertThat(rejectedView.failureMessage()).contains("in-flight");
+        assertThat(gw.list()).extracting(KeyStateView::status).contains(KeyStatus.REJECTED);
+
+        // 拒绝记录不影响后续同键请求：在途执行释放容量后该键可正常执行
+        release.countDown();
+        assertThat(first.get(5, TimeUnit.SECONDS)).isEqualTo("done");
+        assertThat(gw.execute("caller-a", "rejected-key", () -> "now-ok")).isEqualTo("now-ok");
+        assertThat(gw.inspect("caller-a", "rejected-key")).get()
+                .extracting(KeyStateView::status).isEqualTo(KeyStatus.COMPLETED);
+        pool.shutdownNow();
+    }
+
+    @Test
+    void rejectedRecordDisappearsAfterTtl() throws Exception {
+        IdempotencyGateway gw = newGateway(p -> {
+            p.setMaxInFlight(1);
+            p.setEntryTtl(Duration.ofMinutes(1));
+        });
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<String> first = pool.submit(() -> gw.execute("caller-a", "k1", () -> {
+            entered.countDown();
+            await(release);
+            return "done";
+        }));
+        await(entered);
+
+        assertThatThrownBy(() -> gw.execute("caller-a", "rejected-key", () -> "never"))
+                .isInstanceOf(CapacityExceededException.class);
+        assertThat(gw.inspect("caller-a", "rejected-key")).get()
+                .extracting(KeyStateView::status).isEqualTo(KeyStatus.REJECTED);
+
+        // 超过拒绝记录有效期后：查询不可见，后台清理也将其移除（不会长期堆积）
+        clock.advance(Duration.ofMinutes(1).plusMillis(1));
+        assertThat(gw.inspect("caller-a", "rejected-key")).isEmpty();
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5))
+                .until(() -> gw.list().stream().noneMatch(v -> v.key().equals("rejected-key")));
+
+        release.countDown();
+        assertThat(first.get(5, TimeUnit.SECONDS)).isEqualTo("done");
+        pool.shutdownNow();
+    }
+
+    @Test
+    void burstDuringLongExecutionTriggersOnceAndWaitTimeoutDoesNotKillExecution() throws Exception {
+        IdempotencyGateway gw = newGateway(p -> {
+            p.setWaitTimeout(Duration.ofMillis(100));
+            p.setMaxWaitersPerKey(64);
+        });
+        AtomicInteger executions = new AtomicInteger();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+
+        ExecutorService pool = Executors.newFixedThreadPool(24);
+        Future<String> leader = pool.submit(() -> gw.execute("caller-a", "hot", () -> {
+            executions.incrementAndGet();
+            entered.countDown();
+            await(release);
+            return "one-result";
+        }));
+        await(entered);
+
+        // 大量同键并发请求涌入：等待上限只让等待方自己超时，绝不能误判执行失败/重复触发下游
+        List<Future<String>> waiters = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            waiters.add(pool.submit(() -> gw.execute("caller-a", "hot", () -> {
+                executions.incrementAndGet();
+                return "should-not-run";
+            })));
+        }
+        int timedOut = 0;
+        for (Future<String> f : waiters) {
+            try {
+                assertThat(f.get(5, TimeUnit.SECONDS)).isEqualTo("one-result");
+            } catch (ExecutionException e) {
+                assertThat(e.getCause()).isInstanceOf(WaitTimeoutException.class);
+                timedOut++;
+            }
+        }
+        assertThat(timedOut).isGreaterThan(0);
+
+        // 在途执行不受影响，完成后后续同键请求复用缓存结果，下游始终只触发一次
+        release.countDown();
+        assertThat(leader.get(5, TimeUnit.SECONDS)).isEqualTo("one-result");
+        assertThat(gw.execute("caller-a", "hot", () -> "again")).isEqualTo("one-result");
+        assertThat(executions.get()).isEqualTo(1);
         pool.shutdownNow();
     }
 
